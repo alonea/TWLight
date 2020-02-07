@@ -10,6 +10,7 @@ from django.conf import settings
 from django.contrib.auth.models import User, AnonymousUser
 from django.core.exceptions import PermissionDenied
 from django.core.urlresolvers import resolve, reverse
+from django.core.management import call_command
 from django.test import TestCase, Client, RequestFactory
 from django.utils.translation import get_language
 from django.utils.html import escape
@@ -904,20 +905,56 @@ class EditorModelTestCase(TestCase):
         self.test_editor.wp_editcount_updated = now()
         self.assertFalse(bundle_eligible)
 
-        # Currently, a valid user will pass 60 days after their first login if they have 10 more edits,
+        # Without a scheduled management command, a valid user will pass 60 days after their first login if they have 10 more edits,
         # even if we're not sure whether they made those edits in the last 30 days.
-        # TODO: add management command to be executed as a cron job to periodically update editors' recent edit counts.
-        # That way the time delta used to calculate recent edits is never greater than 30 days.
-        identity["blocked"] = False
-        not_blocked = editor_not_blocked(identity)
-        valid = editor_valid(enough_edits, account_old_enough, not_blocked)
 
+        # Valid data for first time logging in after bundle was launched. 60 days ago.
+        global_userinfo["editcount"] = 500
+        identity["blocked"] = False
+        self.test_editor.wp_editcount = global_userinfo["editcount"]
+        self.test_editor.wp_registered = editor_reg_date(identity, global_userinfo)
+        self.test_editor.wp_account_old_enough = editor_account_old_enough(registered)
+        self.test_editor.wp_enough_edits = editor_enough_edits(global_userinfo)
+        self.test_editor.wp_not_blocked = editor_not_blocked(identity)
+        self.test_editor.wp_valid = editor_valid(
+            self.test_editor.wp_enough_edits,
+            self.test_editor.wp_account_old_enough,
+            self.test_editor.wp_not_blocked,
+        )
         self.test_editor.wp_editcount_updated = now() - timedelta(days=60)
         self.test_editor.wp_editcount_prev_updated = (
             self.test_editor.wp_editcount_prev_updated - timedelta(days=60)
         )
+        self.test_editor.wp_bundle_eligible = True
+        self.test_editor.save()
+
+        # 15 days later, they logged with 10 more edits. Valid
+        global_userinfo["editcount"] = global_userinfo["editcount"] + 10
+        self.test_editor.wp_editcount = global_userinfo["editcount"]
+        self.test_editor.wp_editcount_updated = (
+            self.test_editor.wp_editcount_updated + timedelta(days=15)
+        )
+        self.test_editor.wp_editcount_prev_updated = (
+            self.test_editor.wp_editcount_prev_updated + timedelta(days=15)
+        )
+        self.test_editor.wp_bundle_eligible = True
+        self.test_editor.save()
+        self.test_editor.refresh_from_db()
+        self.assertTrue(self.test_editor.wp_bundle_eligible)
+
+        # 31 days later with no activity, their eligibility gets updated by the cron task.
+        command = call_command(
+            "user_update_eligibility",
+            datetime=datetime.isoformat(
+                self.test_editor.wp_editcount_updated + timedelta(days=31)
+            ),
+            global_userinfo=global_userinfo,
+        )
+
+        # They login today and aren't eligible for the bundle.
+        self.test_editor.refresh_from_db()
         self.test_editor.wp_editcount_prev_updated, self.test_editor.wp_editcount_prev, self.test_editor.wp_editcount_recent, self.test_editor.wp_enough_recent_edits = editor_recent_edits(
-            global_userinfo["editcount"] + 10,
+            self.test_editor.wp_editcount,
             self.test_editor.wp_editcount_updated,
             self.test_editor.wp_editcount,
             self.test_editor.wp_editcount_prev_updated,
@@ -925,10 +962,11 @@ class EditorModelTestCase(TestCase):
             self.test_editor.wp_editcount_recent,
             self.test_editor.wp_enough_recent_edits,
         )
-        bundle_eligible = editor_bundle_eligible(
-            valid, self.test_editor.wp_enough_recent_edits
+        self.test_editor.wp_bundle_eligible = editor_bundle_eligible(
+            self.test_editor.wp_valid, self.test_editor.wp_enough_recent_edits
         )
-        self.assertTrue(bundle_eligible)
+        self.test_editor.save()
+        self.assertFalse(self.test_editor.wp_bundle_eligible)
 
     @patch.object(Editor, "get_global_userinfo")
     def test_update_from_wikipedia(self, mock_global_userinfo):
